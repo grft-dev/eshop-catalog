@@ -41,7 +41,7 @@ dotnet add package graft.nuget.catalogservice -v 1.0.0 --source https://grft.dev
 dotnet run
 ```
 
-`CatalogConsumer/Program.cs` points the graft at the local gateway and asks for the first catalog item:
+`CatalogConsumer/Program.cs` points the graft at the local gateway, loads the first catalog item, then asks for a missing one:
 
 ```csharp
 using graft.nuget.CatalogService;
@@ -50,7 +50,16 @@ GraftConfig.Host = "ws://localhost/ws";
 GraftConfig.Stateless = true;
 
 var item = Catalog.GetItem(1);
-Console.WriteLine(item.Name);
+Console.WriteLine($"Pobranie pozycji 1: {item.Name}");
+
+try
+{
+    Catalog.GetItem(999);
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"Pobranie pozycji 999: {ex.Message}");
+}
 ```
 
 `GraftConfig.Stateless = true` returns the whole DTO in one round trip.
@@ -58,15 +67,18 @@ Console.WriteLine(item.Name);
 Expected output:
 
 ```text
-Wanderer Black Hiking Boots
+Pobranie pozycji 1: Wanderer Black Hiking Boots
+Pobranie pozycji 999: Item with id 999 not found.
 ```
 
-That name is the first seeded item (`Id` 1).
+The first line is the seeded item `Id` 1. The second line is the gateway turning a missing item into a plain `Exception`; the message is preserved.
 
 A missing item and an empty warehouse come back as a plain `Exception`. The message is preserved:
 
 - `Catalog.GetItem(999)` — `Item with id 999 not found.`
 - `Catalog.RemoveStock(6, 1)` — `Empty stock, product item Carbon Fiber Trekking Poles is sold out` (item 6 is seeded with no stock)
+
+A step-by-step manual smoke test (in Polish) is in [SMOKE-TEST.md](SMOKE-TEST.md).
 
 ## Dev container
 

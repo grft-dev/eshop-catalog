@@ -4,4 +4,13 @@ GraftConfig.Host = "ws://localhost/ws";
 GraftConfig.Stateless = true;
 
 var item = Catalog.GetItem(1);
-Console.WriteLine(item.Name);
+Console.WriteLine($"Pobranie pozycji 1: {item.Name}");
+
+try
+{
+    Catalog.GetItem(999);
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"Pobranie pozycji 999: {ex.Message}");
+}
