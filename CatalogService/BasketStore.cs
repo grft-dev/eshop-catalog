@@ -11,11 +11,12 @@ internal static class BasketStore
         return ReadBasket(connection, null, buyerId);
     }
 
-    internal static CustomerBasketDto UpdateBasket(string buyerId, BasketItemInput[] items)
+    internal static CustomerBasketDto UpdateBasket(string buyerId, int[] productIds, int[] quantities)
     {
         RequireBuyerId(buyerId);
-        items ??= [];
-        var requested = Normalize(items);
+        productIds ??= [];
+        quantities ??= [];
+        var requested = Normalize(productIds, quantities);
 
         using var connection = Database.OpenConnection();
         using var transaction = connection.BeginTransaction();
@@ -82,7 +83,7 @@ internal static class BasketStore
         }
 
         transaction.Commit();
-        return new CustomerBasketDto { BuyerId = buyerId, Items = snapshots.ToArray() };
+        return ToBasket(buyerId, snapshots.ToArray());
     }
 
     internal static bool DeleteBasket(string buyerId)
@@ -115,7 +116,7 @@ internal static class BasketStore
             basketCommand.Parameters.AddWithValue("buyer_id", buyerId);
             if (basketCommand.ExecuteScalar() is null)
             {
-                return new CustomerBasketDto { BuyerId = buyerId, Items = [] };
+                return ToBasket(buyerId, []);
             }
         }
 
@@ -143,7 +144,18 @@ internal static class BasketStore
             });
         }
 
-        return new CustomerBasketDto { BuyerId = buyerId, Items = items.ToArray() };
+        return ToBasket(buyerId, items.ToArray());
+    }
+
+    private static CustomerBasketDto ToBasket(string buyerId, BasketItemDto[] items)
+    {
+        return new CustomerBasketDto
+        {
+            BuyerId = buyerId,
+            Items = items,
+            ProductName = items.Length == 0 ? "" : items[0].ProductName,
+            Quantity = items.Length == 0 ? 0 : items[0].Quantity
+        };
     }
 
     internal static void RequireBuyerId(string buyerId)
@@ -154,27 +166,29 @@ internal static class BasketStore
         }
     }
 
-    private static Dictionary<int, int> Normalize(BasketItemInput[] items)
+    private static Dictionary<int, int> Normalize(int[] productIds, int[] quantities)
     {
-        var requested = new Dictionary<int, int>();
-        foreach (var input in items)
+        if (productIds.Length != quantities.Length)
         {
-            if (input is null)
-            {
-                throw new CatalogException("Item must be provided.");
-            }
+            throw new CatalogException("Product ids and quantities must have the same length.");
+        }
 
-            if (input.ProductId <= 0)
+        var requested = new Dictionary<int, int>();
+        for (var i = 0; i < productIds.Length; i++)
+        {
+            var productId = productIds[i];
+            var quantity = quantities[i];
+            if (productId <= 0)
             {
                 throw new CatalogException("Id is not valid.");
             }
 
-            if (input.Quantity < 1)
+            if (quantity < 1)
             {
                 throw new CatalogException("Invalid number of units");
             }
 
-            requested[input.ProductId] = checked(requested.GetValueOrDefault(input.ProductId) + input.Quantity);
+            requested[productId] = checked(requested.GetValueOrDefault(productId) + quantity);
         }
 
         return requested;

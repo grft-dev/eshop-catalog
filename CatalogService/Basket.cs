@@ -7,9 +7,9 @@ public static class Basket
         return BasketStore.GetBasket(buyerId);
     }
 
-    public static CustomerBasketDto UpdateBasket(string buyerId, BasketItemInput[] items)
+    public static CustomerBasketDto UpdateBasket(string buyerId, int[] productIds, int[] quantities)
     {
-        return BasketStore.UpdateBasket(buyerId, items);
+        return BasketStore.UpdateBasket(buyerId, productIds, quantities);
     }
 
     public static bool DeleteBasket(string buyerId)

@@ -15,8 +15,8 @@ catch (Exception ex)
     Console.WriteLine($"Getting item 999: {ex.Message}");
 }
 
-var basket = Basket.UpdateBasket("demo", [new BasketItemInput { ProductId = 1, Quantity = 1 }]);
-Console.WriteLine($"Basket: {basket.Items[0].ProductName} x {basket.Items[0].Quantity}");
+var basket = Basket.UpdateBasket("demo", [1], [1]);
+Console.WriteLine($"Basket: {basket.ProductName} x {basket.Quantity}");
 
 var address = new AddressDto
 {
@@ -35,7 +35,7 @@ Console.WriteLine($"Order {order.Id}: {shipped.Status}");
 
 try
 {
-    Basket.UpdateBasket("demo", [new BasketItemInput { ProductId = 6, Quantity = 1 }]);
+    Basket.UpdateBasket("demo", [6], [1]);
     Ordering.Checkout("demo", address);
 }
 catch (Exception ex)

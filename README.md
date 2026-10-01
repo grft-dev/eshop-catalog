@@ -67,8 +67,8 @@ catch (Exception ex)
     Console.WriteLine($"Getting item 999: {ex.Message}");
 }
 
-var basket = Basket.UpdateBasket("demo", [new BasketItemInput { ProductId = 1, Quantity = 1 }]);
-Console.WriteLine($"Basket: {basket.Items[0].ProductName} x {basket.Items[0].Quantity}");
+var basket = Basket.UpdateBasket("demo", [1], [1]);
+Console.WriteLine($"Basket: {basket.ProductName} x {basket.Quantity}");
 
 var address = new AddressDto
 {
@@ -87,7 +87,7 @@ Console.WriteLine($"Order {order.Id}: {shipped.Status}");
 
 try
 {
-    Basket.UpdateBasket("demo", [new BasketItemInput { ProductId = 6, Quantity = 1 }]);
+    Basket.UpdateBasket("demo", [6], [1]);
     Ordering.Checkout("demo", address);
 }
 catch (Exception ex)
@@ -98,7 +98,7 @@ catch (Exception ex)
 
 `GraftConfig.Stateless = true` returns the whole DTO in one round trip.
 
-`UpdateBasket` copies the current name, price, and picture from the catalog. `Checkout` reads the price again, removes stock for every line or leaves the catalog and the basket unchanged, then stores an order already in `StockConfirmed`. There is no `Paid` status. `Ship` moves that order to `Shipped`. `Cancel` is allowed only from `StockConfirmed` and puts the units back.
+`UpdateBasket` copies the current name, price, and picture from the catalog. The returned basket exposes the first line as `ProductName` and `Quantity`. `Checkout` reads the price again, removes stock for every line or leaves the catalog and the basket unchanged, then stores an order already in `StockConfirmed`. There is no `Paid` status. `Ship` moves that order to `Shipped`. `Cancel` is allowed only from `StockConfirmed` and puts the units back.
 
 Expected output:
 
