@@ -1,0 +1,32 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: eshop
+      POSTGRES_USER: eshop
+      POSTGRES_PASSWORD: eshop
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U eshop -d eshop"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./CatalogService
+    environment:
+      ConnectionStrings__Catalog: Host=db;Port=5432;Database=eshop;Username=eshop;Password=eshop
+    ports:
+      - "80:80"
+      - "81:81"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  postgres-data:

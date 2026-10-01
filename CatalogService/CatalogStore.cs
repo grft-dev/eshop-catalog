@@ -1,11 +1,17 @@
+using Npgsql;
+
 namespace CatalogService;
 
 internal static class CatalogStore
 {
-    private static readonly object Gate = new();
-    private static readonly List<NamedRecord> Brands = CreateBrands();
-    private static readonly List<NamedRecord> Types = CreateTypes();
-    private static readonly List<ItemRecord> Items = CreateItems();
+    private const string ItemColumns = """
+        SELECT i.id, i.name, i.description, i.price, i.picture_file_name,
+               i.catalog_type_id, t.name, i.catalog_brand_id, b.name,
+               i.available_stock, i.restock_threshold, i.max_stock_threshold, i.on_reorder
+        FROM catalog_items i
+        JOIN catalog_types t ON t.id = i.catalog_type_id
+        JOIN catalog_brands b ON b.id = i.catalog_brand_id
+        """;
 
     internal static CatalogPage ListItems(int pageIndex, int pageSize, string name, int[] typeIds, int[] brandIds)
     {
@@ -22,245 +28,343 @@ internal static class CatalogStore
         typeIds ??= [];
         brandIds ??= [];
 
-        lock (Gate)
+        using var connection = Database.OpenConnection();
+        const string filter = """
+            WHERE (@name = '' OR left(lower(i.name), length(@name)) = lower(@name))
+              AND (cardinality(@type_ids) = 0 OR i.catalog_type_id = ANY(@type_ids))
+              AND (cardinality(@brand_ids) = 0 OR i.catalog_brand_id = ANY(@brand_ids))
+            """;
+
+        using var countCommand = new NpgsqlCommand($"SELECT count(*) FROM catalog_items i {filter}", connection);
+        AddFilters(countCommand, name, typeIds, brandIds);
+        var totalItems = Convert.ToInt32(countCommand.ExecuteScalar());
+
+        using var command = new NpgsqlCommand(
+            $"{ItemColumns} {filter} ORDER BY i.name COLLATE \"C\" OFFSET @offset LIMIT @limit",
+            connection);
+        AddFilters(command, name, typeIds, brandIds);
+        command.Parameters.AddWithValue("offset", (long)pageIndex * pageSize);
+        command.Parameters.AddWithValue("limit", pageSize);
+
+        return new CatalogPage
         {
-            IEnumerable<ItemRecord> query = Items;
-            if (!string.IsNullOrEmpty(name))
-            {
-                query = query.Where(item => item.Name.StartsWith(name, StringComparison.OrdinalIgnoreCase));
-            }
-
-            if (typeIds.Length > 0)
-            {
-                query = query.Where(item => typeIds.Contains(item.CatalogTypeId));
-            }
-
-            if (brandIds.Length > 0)
-            {
-                query = query.Where(item => brandIds.Contains(item.CatalogBrandId));
-            }
-
-            var matched = query.OrderBy(item => item.Name, StringComparer.Ordinal).ToList();
-            var skip = (long)pageSize * pageIndex;
-            var page = skip >= matched.Count
-                ? []
-                : matched.Skip((int)skip).Take(pageSize).Select(ToDto).ToArray();
-
-            return new CatalogPage
-            {
-                PageIndex = pageIndex,
-                PageSize = pageSize,
-                TotalItems = matched.Count,
-                Items = page
-            };
-        }
+            PageIndex = pageIndex,
+            PageSize = pageSize,
+            TotalItems = totalItems,
+            Items = ReadItems(command)
+        };
     }
 
     internal static CatalogItemDto GetItem(int id)
     {
-        lock (Gate)
-        {
-            return ToDto(RequireItem(id));
-        }
+        using var connection = Database.OpenConnection();
+        return RequireItem(connection, null, id);
     }
 
     internal static CatalogItemDto[] GetItemsByIds(int[] ids)
     {
         ids ??= [];
-        lock (Gate)
+        if (ids.Any(id => id <= 0))
         {
-            var found = new List<CatalogItemDto>(ids.Length);
-            foreach (var id in ids)
-            {
-                if (id <= 0)
-                {
-                    throw new CatalogException("Id is not valid.");
-                }
-
-                var item = Items.FirstOrDefault(candidate => candidate.Id == id);
-                if (item is not null)
-                {
-                    found.Add(ToDto(item));
-                }
-            }
-
-            return found.ToArray();
+            throw new CatalogException("Id is not valid.");
         }
+
+        if (ids.Length == 0)
+        {
+            return [];
+        }
+
+        using var connection = Database.OpenConnection();
+        using var command = new NpgsqlCommand($"{ItemColumns} WHERE i.id = ANY(@ids)", connection);
+        command.Parameters.AddWithValue("ids", ids);
+        var byId = ReadItems(command).ToDictionary(item => item.Id);
+        return ids.Where(byId.ContainsKey).Select(id => byId[id]).ToArray();
     }
 
     internal static CatalogBrandDto[] ListBrands()
     {
-        lock (Gate)
+        using var connection = Database.OpenConnection();
+        using var command = new NpgsqlCommand(
+            "SELECT id, name FROM catalog_brands ORDER BY name COLLATE \"C\"",
+            connection);
+        using var reader = command.ExecuteReader();
+        var result = new List<CatalogBrandDto>();
+        while (reader.Read())
         {
-            return Brands
-                .OrderBy(brand => brand.Name, StringComparer.Ordinal)
-                .Select(brand => new CatalogBrandDto { Id = brand.Id, Brand = brand.Name })
-                .ToArray();
+            result.Add(new CatalogBrandDto { Id = reader.GetInt32(0), Brand = reader.GetString(1) });
         }
+
+        return result.ToArray();
     }
 
     internal static CatalogTypeDto[] ListTypes()
     {
-        lock (Gate)
+        using var connection = Database.OpenConnection();
+        using var command = new NpgsqlCommand(
+            "SELECT id, name FROM catalog_types ORDER BY name COLLATE \"C\"",
+            connection);
+        using var reader = command.ExecuteReader();
+        var result = new List<CatalogTypeDto>();
+        while (reader.Read())
         {
-            return Types
-                .OrderBy(type => type.Name, StringComparer.Ordinal)
-                .Select(type => new CatalogTypeDto { Id = type.Id, Type = type.Name })
-                .ToArray();
+            result.Add(new CatalogTypeDto { Id = reader.GetInt32(0), Type = reader.GetString(1) });
         }
+
+        return result.ToArray();
     }
 
     internal static CatalogFacetsDto GetFacets(int[] typeIds, int[] brandIds)
     {
         typeIds ??= [];
         brandIds ??= [];
+        using var connection = Database.OpenConnection();
 
-        lock (Gate)
+        var brands = ReadFacetCounts(
+            connection,
+            """
+            SELECT catalog_brand_id, count(*)::integer
+            FROM catalog_items
+            WHERE cardinality(@ids) = 0 OR catalog_type_id = ANY(@ids)
+            GROUP BY catalog_brand_id
+            ORDER BY catalog_brand_id
+            """,
+            typeIds);
+
+        var types = ReadFacetCounts(
+            connection,
+            """
+            SELECT catalog_type_id, count(*)::integer
+            FROM catalog_items
+            WHERE cardinality(@ids) = 0 OR catalog_brand_id = ANY(@ids)
+            GROUP BY catalog_type_id
+            ORDER BY catalog_type_id
+            """,
+            brandIds);
+
+        return new CatalogFacetsDto
         {
-            IEnumerable<ItemRecord> brandScope = Items;
-            if (typeIds.Length > 0)
-            {
-                brandScope = brandScope.Where(item => typeIds.Contains(item.CatalogTypeId));
-            }
-
-            var brands = brandScope
-                .GroupBy(item => item.CatalogBrandId)
-                .Select(group => new CatalogFacetCountDto { Id = group.Key, Count = group.Count() })
-                .OrderBy(count => count.Id)
-                .ToArray();
-
-            IEnumerable<ItemRecord> typeScope = Items;
-            if (brandIds.Length > 0)
-            {
-                typeScope = typeScope.Where(item => brandIds.Contains(item.CatalogBrandId));
-            }
-
-            var types = typeScope
-                .GroupBy(item => item.CatalogTypeId)
-                .Select(group => new CatalogFacetCountDto { Id = group.Key, Count = group.Count() })
-                .OrderBy(count => count.Id)
-                .ToArray();
-
-            return new CatalogFacetsDto
-            {
-                Brands = brands,
-                Types = types,
-                BrandTotal = brands.Sum(count => count.Count),
-                TypeTotal = types.Sum(count => count.Count)
-            };
-        }
+            Brands = brands,
+            Types = types,
+            BrandTotal = brands.Sum(count => count.Count),
+            TypeTotal = types.Sum(count => count.Count)
+        };
     }
 
     internal static CatalogItemDto CreateItem(CatalogItemInput input)
     {
         ValidateInput(input);
-        lock (Gate)
-        {
-            RequireBrand(input.CatalogBrandId);
-            RequireType(input.CatalogTypeId);
+        using var connection = Database.OpenConnection();
+        RequireBrand(connection, null, input.CatalogBrandId);
+        RequireType(connection, null, input.CatalogTypeId);
 
-            var item = new ItemRecord
-            {
-                Id = Items.Count == 0 ? 1 : Items.Max(existing => existing.Id) + 1,
-                Name = input.Name,
-                Description = input.Description ?? "",
-                Price = input.Price,
-                PictureFileName = input.PictureFileName ?? "",
-                CatalogTypeId = input.CatalogTypeId,
-                CatalogBrandId = input.CatalogBrandId,
-                AvailableStock = input.AvailableStock,
-                RestockThreshold = input.RestockThreshold,
-                MaxStockThreshold = input.MaxStockThreshold,
-                OnReorder = input.AvailableStock == 0
-            };
-            Items.Add(item);
-            return ToDto(item);
-        }
+        using var command = new NpgsqlCommand(
+            """
+            INSERT INTO catalog_items
+                (name, description, price, picture_file_name, catalog_type_id, catalog_brand_id,
+                 available_stock, restock_threshold, max_stock_threshold, on_reorder)
+            VALUES
+                (@name, @description, @price, @picture, @type_id, @brand_id,
+                 @stock, @restock, @max_stock, @on_reorder)
+            RETURNING id
+            """,
+            connection);
+        AddItemInput(command, input);
+        var id = Convert.ToInt32(command.ExecuteScalar());
+        return RequireItem(connection, null, id);
     }
 
     internal static CatalogItemDto UpdateItem(int id, CatalogItemInput input)
     {
         ValidateInput(input);
-        lock (Gate)
-        {
-            var item = RequireItem(id);
-            RequireBrand(input.CatalogBrandId);
-            RequireType(input.CatalogTypeId);
+        using var connection = Database.OpenConnection();
+        RequireItem(connection, null, id);
+        RequireBrand(connection, null, input.CatalogBrandId);
+        RequireType(connection, null, input.CatalogTypeId);
 
-            item.Name = input.Name;
-            item.Description = input.Description ?? "";
-            item.Price = input.Price;
-            item.PictureFileName = input.PictureFileName ?? "";
-            item.CatalogTypeId = input.CatalogTypeId;
-            item.CatalogBrandId = input.CatalogBrandId;
-            item.AvailableStock = input.AvailableStock;
-            item.RestockThreshold = input.RestockThreshold;
-            item.MaxStockThreshold = input.MaxStockThreshold;
-            item.OnReorder = input.AvailableStock == 0;
-            return ToDto(item);
-        }
+        using var command = new NpgsqlCommand(
+            """
+            UPDATE catalog_items
+            SET name = @name, description = @description, price = @price,
+                picture_file_name = @picture, catalog_type_id = @type_id,
+                catalog_brand_id = @brand_id, available_stock = @stock,
+                restock_threshold = @restock, max_stock_threshold = @max_stock,
+                on_reorder = @on_reorder
+            WHERE id = @id
+            """,
+            connection);
+        AddItemInput(command, input);
+        command.Parameters.AddWithValue("id", id);
+        command.ExecuteNonQuery();
+        return RequireItem(connection, null, id);
     }
 
     internal static bool DeleteItem(int id)
     {
-        lock (Gate)
-        {
-            var item = RequireItem(id);
-            Items.Remove(item);
-            return true;
-        }
+        using var connection = Database.OpenConnection();
+        RequireItem(connection, null, id);
+        using var command = new NpgsqlCommand("DELETE FROM catalog_items WHERE id = @id", connection);
+        command.Parameters.AddWithValue("id", id);
+        command.ExecuteNonQuery();
+        return true;
     }
 
     internal static int RemoveStock(int id, int quantity)
     {
-        lock (Gate)
+        if (quantity <= 0)
         {
-            var item = RequireItem(id);
-            if (item.AvailableStock == 0)
-            {
-                throw new CatalogException($"Empty stock, product item {item.Name} is sold out");
-            }
-
-            if (quantity <= 0)
-            {
-                throw new CatalogException("Item units desired should be greater than zero");
-            }
-
-            var removed = Math.Min(quantity, item.AvailableStock);
-            item.AvailableStock -= removed;
-            return removed;
+            throw new CatalogException("Item units desired should be greater than zero");
         }
+
+        using var connection = Database.OpenConnection();
+        using var transaction = connection.BeginTransaction();
+        var item = RequireItem(connection, transaction, id, forUpdate: true);
+        if (item.AvailableStock == 0)
+        {
+            throw new CatalogException($"Empty stock, product item {item.Name} is sold out");
+        }
+
+        var removed = Math.Min(quantity, item.AvailableStock);
+        using var command = new NpgsqlCommand(
+            """
+            UPDATE catalog_items
+            SET available_stock = available_stock - @quantity,
+                on_reorder = available_stock - @quantity = 0
+            WHERE id = @id
+            """,
+            connection,
+            transaction);
+        command.Parameters.AddWithValue("id", id);
+        command.Parameters.AddWithValue("quantity", removed);
+        command.ExecuteNonQuery();
+        transaction.Commit();
+        return removed;
     }
 
-    private static ItemRecord RequireItem(int id)
+    internal static CatalogItemDto RequireItem(
+        NpgsqlConnection connection,
+        NpgsqlTransaction? transaction,
+        int id,
+        bool forUpdate = false)
     {
         if (id <= 0)
         {
             throw new CatalogException("Id is not valid.");
         }
 
-        var item = Items.FirstOrDefault(candidate => candidate.Id == id);
-        if (item is null)
+        var sql = $"{ItemColumns} WHERE i.id = @id{(forUpdate ? " FOR UPDATE OF i" : "")}";
+        using var command = new NpgsqlCommand(sql, connection, transaction);
+        command.Parameters.AddWithValue("id", id);
+        using var reader = command.ExecuteReader();
+        if (!reader.Read())
         {
             throw new CatalogException($"Item with id {id} not found.");
         }
 
-        return item;
+        return ReadItem(reader);
     }
 
-    private static void RequireBrand(int id)
+    private static void AddFilters(
+        NpgsqlCommand command,
+        string name,
+        int[] typeIds,
+        int[] brandIds)
     {
-        if (Brands.All(brand => brand.Id != id))
+        command.Parameters.AddWithValue("name", name ?? "");
+        command.Parameters.AddWithValue("type_ids", typeIds);
+        command.Parameters.AddWithValue("brand_ids", brandIds);
+    }
+
+    private static void AddItemInput(NpgsqlCommand command, CatalogItemInput input)
+    {
+        command.Parameters.AddWithValue("name", input.Name);
+        command.Parameters.AddWithValue("description", input.Description ?? "");
+        command.Parameters.AddWithValue("price", input.Price);
+        command.Parameters.AddWithValue("picture", input.PictureFileName ?? "");
+        command.Parameters.AddWithValue("type_id", input.CatalogTypeId);
+        command.Parameters.AddWithValue("brand_id", input.CatalogBrandId);
+        command.Parameters.AddWithValue("stock", input.AvailableStock);
+        command.Parameters.AddWithValue("restock", input.RestockThreshold);
+        command.Parameters.AddWithValue("max_stock", input.MaxStockThreshold);
+        command.Parameters.AddWithValue("on_reorder", input.AvailableStock == 0);
+    }
+
+    private static CatalogItemDto[] ReadItems(NpgsqlCommand command)
+    {
+        using var reader = command.ExecuteReader();
+        var result = new List<CatalogItemDto>();
+        while (reader.Read())
         {
-            throw new CatalogException($"Catalog brand {id} was not found.");
+            result.Add(ReadItem(reader));
         }
+
+        return result.ToArray();
     }
 
-    private static void RequireType(int id)
+    private static CatalogItemDto ReadItem(NpgsqlDataReader reader)
     {
-        if (Types.All(type => type.Id != id))
+        return new CatalogItemDto
         {
-            throw new CatalogException($"Catalog type {id} was not found.");
+            Id = reader.GetInt32(0),
+            Name = reader.GetString(1),
+            Description = reader.GetString(2),
+            Price = reader.GetDecimal(3),
+            PictureFileName = reader.GetString(4),
+            CatalogTypeId = reader.GetInt32(5),
+            CatalogType = reader.GetString(6),
+            CatalogBrandId = reader.GetInt32(7),
+            CatalogBrand = reader.GetString(8),
+            AvailableStock = reader.GetInt32(9),
+            RestockThreshold = reader.GetInt32(10),
+            MaxStockThreshold = reader.GetInt32(11),
+            OnReorder = reader.GetBoolean(12)
+        };
+    }
+
+    private static CatalogFacetCountDto[] ReadFacetCounts(
+        NpgsqlConnection connection,
+        string sql,
+        int[] ids)
+    {
+        using var command = new NpgsqlCommand(sql, connection);
+        command.Parameters.AddWithValue("ids", ids);
+        using var reader = command.ExecuteReader();
+        var result = new List<CatalogFacetCountDto>();
+        while (reader.Read())
+        {
+            result.Add(new CatalogFacetCountDto { Id = reader.GetInt32(0), Count = reader.GetInt32(1) });
+        }
+
+        return result.ToArray();
+    }
+
+    private static void RequireBrand(
+        NpgsqlConnection connection,
+        NpgsqlTransaction? transaction,
+        int id)
+    {
+        RequireReference(connection, transaction, "catalog_brands", id, $"Catalog brand {id} was not found.");
+    }
+
+    private static void RequireType(
+        NpgsqlConnection connection,
+        NpgsqlTransaction? transaction,
+        int id)
+    {
+        RequireReference(connection, transaction, "catalog_types", id, $"Catalog type {id} was not found.");
+    }
+
+    private static void RequireReference(
+        NpgsqlConnection connection,
+        NpgsqlTransaction? transaction,
+        string table,
+        int id,
+        string message)
+    {
+        using var command = new NpgsqlCommand($"SELECT EXISTS (SELECT 1 FROM {table} WHERE id = @id)", connection, transaction);
+        command.Parameters.AddWithValue("id", id);
+        if (!(bool)command.ExecuteScalar()!)
+        {
+            throw new CatalogException(message);
         }
     }
 
@@ -280,126 +384,5 @@ internal static class CatalogStore
         {
             throw new CatalogException("Stock values must be zero or greater.");
         }
-    }
-
-    private static CatalogItemDto ToDto(ItemRecord item)
-    {
-        var brand = Brands.First(candidate => candidate.Id == item.CatalogBrandId).Name;
-        var type = Types.First(candidate => candidate.Id == item.CatalogTypeId).Name;
-        return new CatalogItemDto
-        {
-            Id = item.Id,
-            Name = item.Name,
-            Description = item.Description,
-            Price = item.Price,
-            PictureFileName = item.PictureFileName,
-            CatalogTypeId = item.CatalogTypeId,
-            CatalogType = type,
-            CatalogBrandId = item.CatalogBrandId,
-            CatalogBrand = brand,
-            AvailableStock = item.AvailableStock,
-            RestockThreshold = item.RestockThreshold,
-            MaxStockThreshold = item.MaxStockThreshold,
-            OnReorder = item.OnReorder
-        };
-    }
-
-    private static List<NamedRecord> CreateBrands()
-    {
-        return
-        [
-            new NamedRecord(1, "Daybird"),
-            new NamedRecord(2, "Gravitator"),
-            new NamedRecord(3, "WildRunner"),
-            new NamedRecord(4, "Quester"),
-            new NamedRecord(5, "B&R"),
-            new NamedRecord(6, "Raptor Elite"),
-            new NamedRecord(7, "Solstix"),
-            new NamedRecord(8, "Grolltex")
-        ];
-    }
-
-    private static List<NamedRecord> CreateTypes()
-    {
-        return
-        [
-            new NamedRecord(1, "Footwear"),
-            new NamedRecord(2, "Climbing"),
-            new NamedRecord(3, "Ski/boarding"),
-            new NamedRecord(4, "Bags"),
-            new NamedRecord(5, "Trekking"),
-            new NamedRecord(6, "Jackets")
-        ];
-    }
-
-    private static List<ItemRecord> CreateItems()
-    {
-        return
-        [
-            Item(1, "Wanderer Black Hiking Boots", "Daybird's Wanderer Hiking Boots in sleek black are perfect for all your outdoor adventures. These boots are made with a waterproof leather upper and a durable rubber sole for superior traction. With their cushioned insole and padded collar, these boots will keep you comfortable all day long.", 109.99m, 1, 1, 100, false),
-            Item(2, "Summit Pro Harness", "Conquer new heights with the Summit Pro Harness by Gravitator. This lightweight and durable climbing harness features adjustable leg loops and waist belt for a customized fit. With its vibrant blue color, you'll look stylish while maneuvering difficult routes. Safety is a top priority with a reinforced tie-in point and strong webbing loops.", 89.99m, 2, 2, 50, false),
-            Item(3, "Alpine Fusion Goggles", "Enhance your skiing experience with the Alpine Fusion Goggles from WildRunner. These goggles offer full UV protection and anti-fog lenses to keep your vision clear on the slopes. With their stylish silver frame and orange lenses, you'll stand out from the crowd. Adjustable straps ensure a secure fit, while the soft foam padding provides comfort all day long.", 79.99m, 3, 3, 40, false),
-            Item(4, "Expedition Backpack", "The Expedition Backpack by Quester is a must-have for every outdoor enthusiast. With its spacious interior and multiple pockets, you can easily carry all your gear and essentials. Made with durable nylon fabric, this backpack is built to withstand the toughest conditions. The orange accents add a touch of style to this functional backpack.", 129.99m, 4, 4, 30, false),
-            Item(5, "Blizzard Rider Snowboard", "Get ready to ride the slopes with the Blizzard Rider Snowboard by B&R. This versatile snowboard is perfect for riders of all levels with its medium flex and twin shape. Its black and blue color scheme gives it a sleek and cool look. Whether you're carving turns or hitting the terrain park, this snowboard will help you shred with confidence.", 299.99m, 3, 5, 12, false),
-            Item(6, "Carbon Fiber Trekking Poles", "The Carbon Fiber Trekking Poles by Raptor Elite are the ultimate companion for your hiking adventures. Designed with lightweight carbon fiber shafts, these poles provide excellent support and durability. The comfortable and adjustable cork grips ensure a secure hold, while the blue accents add a stylish touch. Compact and collapsible, these trekking poles are easy to transport and store.", 69.99m, 5, 6, 0, true),
-            Item(7, "Explorer 45L Backpack", "The Explorer 45L Backpack by Solstix is perfect for your next outdoor expedition. Made with waterproof and tear-resistant materials, this backpack can withstand even the harshest weather conditions. With its spacious main compartment and multiple pockets, you can easily organize your gear. The green and black color scheme adds a rugged and adventurous edge.", 149.99m, 4, 7, 20, false),
-            Item(8, "Frostbite Insulated Jacket", "Stay warm and stylish with the Frostbite Insulated Jacket by Grolltex. Featuring a water-resistant outer shell and lightweight insulation, this jacket is perfect for cold weather adventures. The black and gray color combination and Grolltex logo add a touch of sophistication. With its adjustable hood and multiple pockets, this jacket offers both style and functionality.", 179.99m, 6, 8, 15, false)
-        ];
-    }
-
-    private static ItemRecord Item(int id, string name, string description, decimal price, int typeId, int brandId, int stock, bool onReorder)
-    {
-        return new ItemRecord
-        {
-            Id = id,
-            Name = name,
-            Description = description,
-            Price = price,
-            PictureFileName = $"{id}.png",
-            CatalogTypeId = typeId,
-            CatalogBrandId = brandId,
-            AvailableStock = stock,
-            RestockThreshold = 10,
-            MaxStockThreshold = 200,
-            OnReorder = onReorder
-        };
-    }
-
-    private sealed class NamedRecord
-    {
-        public NamedRecord(int id, string name)
-        {
-            Id = id;
-            Name = name;
-        }
-
-        public int Id { get; }
-
-        public string Name { get; }
-    }
-
-    private sealed class ItemRecord
-    {
-        public int Id { get; set; }
-
-        public string Name { get; set; } = "";
-
-        public string Description { get; set; } = "";
-
-        public decimal Price { get; set; }
-
-        public string PictureFileName { get; set; } = "";
-
-        public int CatalogTypeId { get; set; }
-
-        public int CatalogBrandId { get; set; }
-
-        public int AvailableStock { get; set; }
-
-        public int RestockThreshold { get; set; }
-
-        public int MaxStockThreshold { get; set; }
-
-        public bool OnReorder { get; set; }
     }
 }
